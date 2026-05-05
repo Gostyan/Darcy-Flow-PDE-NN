@@ -1,0 +1,20 @@
+# Dataset (large HDF5 files)
+dataset/*.hdf5
+
+# Pretrained model weights (large .tar files)
+pretrain_model/fno/*.tar
+pretrain_model/unet/*.tar
+
+# Trained checkpoints
+checkpoints/**/*.pt
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Results
+results/
