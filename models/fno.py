@@ -34,7 +34,10 @@ class SpectralConv2d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
-        x_ft = torch.fft.rfft2(x)
+        # rfft2 requires float32; upcast temporarily when under bfloat16 autocast
+        orig_dtype = x.dtype
+        x_f = x.float()
+        x_ft = torch.fft.rfft2(x_f)
 
         out_ft = torch.zeros(B, self.out_channels, x.size(-2), x.size(-1) // 2 + 1,
                              dtype=torch.cfloat, device=x.device)
@@ -44,7 +47,7 @@ class SpectralConv2d(nn.Module):
         out_ft[:, :, -self.modes1:, :self.modes2] = self._compl_mul2d(
             x_ft[:, :, -self.modes1:, :self.modes2], self.weights2
         )
-        return torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
+        return torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1))).to(orig_dtype)
 
 
 class FNO2d(nn.Module):

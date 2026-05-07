@@ -68,6 +68,7 @@ python train_pinn_unet.py --pretrain_path checkpoints/unet/best_model.pt --lr 1e
 | `--pretrain_path` | 自动 | 预训练权重路径（`.tar` 或 `.pt`）|
 | `--lambda_pde` | 0.1 | PDE 残差损失权重（仅 PINN）|
 | `--lambda_bc` | 10.0 | 边界条件损失权重（仅 PINN）|
+| `--resume` | - | 续训|
 
 训练完成后检查点保存在 `checkpoints/<model>/best_model.pt`。
 
@@ -88,19 +89,39 @@ python evaluate.py
 
 ---
 
-## 项目结构
+## 课程论文实验快速复现（500样本量，400 epoch，速度很快，单张RTX4090下一个模型只要跑3~5分钟左右）
 
 ```
-├── models/
-│   ├── fno.py          # Fourier Neural Operator (FNO2d)
-│   └── unet.py         # U-Net (UNet2d)
-├── utils/
-│   ├── dataset.py      # HDF5 数据加载
-│   ├── physics.py      # Darcy PDE 残差 / 边界损失
-│   └── metrics.py      # 评估指标
-├── train_unet.py       # U-Net 训练
-├── train_fno.py        # FNO 训练
-├── train_pinn_unet.py  # PINN-UNet 训练
-├── evaluate.py         # 统一评估 + 可视化
-└── requirements.txt
+cd /root/darcy/Darcy-Flow-PDE-NN && /usr/local/miniconda3/envs/darcy/bin/python train_unet.py \
+    --pretrain_path '' \
+    --num_train_samples 500 \
+    --epochs 400 --lr 1e-3 \
+    --checkpoint_dir checkpoints/low_data/unet
+
+cd /root/darcy/Darcy-Flow-PDE-NN && /usr/local/miniconda3/envs/darcy/bin/python train_fno.py \
+    --pretrain_path '' \
+    --num_train_samples 500 \
+    --epochs 400 --lr 1e-3 \
+    --checkpoint_dir checkpoints/low_data/fno
+
+cd /root/darcy/Darcy-Flow-PDE-NN && /usr/local/miniconda3/envs/darcy/bin/python train_pinn_unet.py \
+    --pretrain_path '' \
+    --num_train_samples 400 \
+    --dynamic_lambda --grad_ratio 0.1 --lambda_update_interval 5 \
+    --lambda_pde 1e-4 --lambda_bc 1.0 --epochs 400 \
+    --checkpoint_dir checkpoints/low_data/pinn_norm_gradnorm
+
+cd /root/darcy/Darcy-Flow-PDE-NN && /usr/local/miniconda3/envs/darcy/bin/python train_pinn_unet.py \
+    --num_train_samples 500 \
+    --normalize_pde \
+    --dynamic_lambda --grad_ratio 0.1 \
+    --lambda_pde 1.0 --lambda_bc 1.0 \
+    --epochs 600 \
+    --checkpoint_dir checkpoints/low_data/pinn_norm_gradnorm \
+    --resume
+
 ```
+### 展示：
+![alt text](fig/Figure_1_Darcy_Flow_Field_Comparison_Sample_03.png)
+
+![alt text](fig/piplinefig.png)

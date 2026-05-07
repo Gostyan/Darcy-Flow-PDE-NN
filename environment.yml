@@ -1,0 +1,14 @@
+name: darcy
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu126
+      - torch==2.6.0+cu126
+      - torchvision==0.21.0+cu126
+      - numpy>=1.23
+      - h5py>=3.7
+      - matplotlib>=3.5
+      - tqdm>=4.64

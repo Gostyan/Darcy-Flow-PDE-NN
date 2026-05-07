@@ -3,10 +3,14 @@ Evaluation metrics for 2D Darcy Flow prediction.
 
 Reported metrics
 ----------------
-mse          : mean squared error
-rel_l2       : relative L2 error  (‖u_pred - u_true‖₂ / ‖u_true‖₂)
-pde_residual : mean absolute PDE residual  |−∇·(a∇û) − 1|
-boundary_err : mean absolute boundary value |û|_∂Ω
+mse              : Mean Squared Error
+rmse             : Root Mean Squared Error  = sqrt(MSE)
+mae              : Mean Absolute Error
+rel_l2           : Relative L2 error  (||u_pred - u_true||_2 / ||u_true||_2)
+max_err          : Maximum absolute error (L-inf norm)
+pde_residual     : Mean absolute PDE residual  |-div(a*grad(u)) - 1|  (MAE, interior)
+pde_residual_rmse: Root-mean-square PDE residual (RMSE, interior)
+boundary_err     : Boundary RMSE  ||u||_dOmega
 """
 
 from __future__ import annotations
@@ -33,26 +37,37 @@ def compute_metrics(
 
     Returns
     -------
-    dict with keys: mse, rel_l2, pde_residual, boundary_err
+    dict with keys: mse, rmse, mae, rel_l2, max_err,
+                    pde_residual, pde_residual_rmse, boundary_err
     """
-    # MSE
-    mse = F.mse_loss(u_pred, u_true).item()
+    diff = u_pred - u_true
 
-    # Relative L2
-    diff_norm = torch.norm(u_pred - u_true, p=2, dim=(-2, -1))
-    true_norm = torch.norm(u_true,          p=2, dim=(-2, -1)) + 1e-8
-    rel_l2 = (diff_norm / true_norm).mean().item()
+    # MSE / RMSE / MAE / Max-Error
+    mse     = F.mse_loss(u_pred, u_true).item()
+    rmse    = mse ** 0.5
+    mae     = diff.abs().mean().item()
+    max_err = diff.abs().max().item()
 
-    # PDE residual (MAE at interior points)
-    res = darcy_pde_residual(a, u_pred)
-    pde_res = res.abs().mean().item()
+    # Relative L2  (||delta_u||_2 / ||u_true||_2, averaged over batch)
+    diff_norm = torch.norm(diff,   p=2, dim=(-2, -1))
+    true_norm = torch.norm(u_true, p=2, dim=(-2, -1)) + 1e-8
+    rel_l2    = (diff_norm / true_norm).mean().item()
 
-    # Boundary error
-    bc_err = darcy_boundary_loss(u_pred).item() ** 0.5   # RMSE on boundary
+    # PDE residual at interior points
+    res              = darcy_pde_residual(a, u_pred)
+    pde_res_mae      = res.abs().mean().item()
+    pde_res_rmse     = res.pow(2).mean().sqrt().item()
+
+    # Boundary RMSE  (u_pred should be 0 on boundary)
+    bc_err = darcy_boundary_loss(u_pred).item() ** 0.5   # sqrt(MSE on boundary)
 
     return {
-        "mse":          mse,
-        "rel_l2":       rel_l2,
-        "pde_residual": pde_res,
-        "boundary_err": bc_err,
+        "mse":               mse,
+        "rmse":              rmse,
+        "mae":               mae,
+        "rel_l2":            rel_l2,
+        "max_err":           max_err,
+        "pde_residual":      pde_res_mae,
+        "pde_residual_rmse": pde_res_rmse,
+        "boundary_err":      bc_err,
     }

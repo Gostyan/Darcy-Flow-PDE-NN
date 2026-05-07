@@ -17,6 +17,8 @@ Usage:
 
 from __future__ import annotations
 
+import json
+
 import argparse
 import io
 import tarfile
@@ -103,16 +105,31 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--lr",            type=float, default=1e-3)
     p.add_argument("--init_features", type=int,   default=32)
     # Physics loss weights
-    p.add_argument("--lambda_pde",    type=float, default=0.1,
-                   help="Weight for PDE residual loss")
+    p.add_argument("--lambda_pde",    type=float, default=1e-4,
+                   help="Weight for PDE residual loss (raw residual^2 ~400, needs small scale)")
     p.add_argument("--lambda_bc",     type=float, default=10.0,
                    help="Weight for boundary condition loss")
     p.add_argument("--reduced_res",   type=int,   default=1)
     p.add_argument("--num_samples",   type=int,   default=-1)
+    p.add_argument("--num_train_samples", type=int, default=-1,
+                   help="Limit training samples only; test set stays full (-1=all)")
     p.add_argument("--checkpoint_dir",type=str,   default="checkpoints/pinn_unet")
     p.add_argument("--log_interval",  type=int,   default=10)
     p.add_argument("--patience",      type=int,   default=20,
                    help="Early stopping patience (in log_interval units; 0 = disabled)")
+    p.add_argument("--num_workers",   type=int,   default=4,
+                   help="DataLoader worker processes (0 = main process only)")
+    p.add_argument("--resume",        action="store_true",
+                   help="Resume training from checkpoint_dir/last_state.pt")
+    # ---- Improvement flags ----
+    p.add_argument("--dynamic_lambda",         action="store_true",
+                   help="GradNorm: adjust lambda_pde so PDE/data grad ratio -> grad_ratio")
+    p.add_argument("--grad_ratio",             type=float, default=0.1)
+    p.add_argument("--lambda_update_interval", type=int,   default=5)
+    p.add_argument("--freeze_encoder",         action="store_true",
+                   help="Freeze enc1-enc4+bottleneck, physics updates decoder only")
+    p.add_argument("--normalize_pde",          action="store_true",
+                   help="Normalize PDE residual by (H-1)^2 to remove 1/dx^2 amplification")
     return p.parse_args()
 
 
@@ -123,18 +140,24 @@ def get_args() -> argparse.Namespace:
 def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    torch.backends.cudnn.benchmark = device.type == "cuda"
     print(f"λ_pde={args.lambda_pde}  λ_bc={args.lambda_bc}")
 
     # ---- data ----
     train_set = DarcyDataset(args.data_path, train=True,
                              reduced_resolution=args.reduced_res,
-                             num_samples_max=args.num_samples)
+                             num_samples_max=args.num_samples,
+                             num_train_samples=args.num_train_samples)
     test_set  = DarcyDataset(args.data_path, train=False,
                              reduced_resolution=args.reduced_res,
                              num_samples_max=args.num_samples)
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,  pin_memory=True)
-    test_loader  = DataLoader(test_set,  batch_size=args.batch_size, shuffle=False, pin_memory=True)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
+                              pin_memory=True, num_workers=args.num_workers,
+                              persistent_workers=args.num_workers > 0)
+    test_loader  = DataLoader(test_set,  batch_size=args.batch_size, shuffle=False,
+                              pin_memory=True, num_workers=args.num_workers,
+                              persistent_workers=args.num_workers > 0)
 
     print(f"Train: {len(train_set)} samples | Test: {len(test_set)} samples")
     print(f"Grid : {train_set.H} x {train_set.W}")
@@ -148,8 +171,19 @@ def train(args: argparse.Namespace) -> None:
     if args.pretrain_path:
         load_pretrain(args.pretrain_path, model)
 
-    # ---- optimiser ----
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # ---- two-stage: freeze encoder + bottleneck ----
+    if args.freeze_encoder:
+        for mname in ["enc1", "enc2", "enc3", "enc4", "bottleneck"]:
+            for param in getattr(model, mname).parameters():
+                param.requires_grad = False
+        n_frozen    = sum(p.numel() for mname in ["enc1","enc2","enc3","enc4","bottleneck"]
+                          for p in getattr(model, mname).parameters())
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[FreezeEncoder] Frozen {n_frozen:,} | Trainable {n_trainable:,}")
+    # ---- optimiser (only trainable params) ----
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr
+    )
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
     criterion = nn.MSELoss()
 
@@ -159,26 +193,73 @@ def train(args: argparse.Namespace) -> None:
 
     best_rel_l2 = float("inf")
     no_improve  = 0
+    start_epoch = 1
+    history: dict = {"epoch": [], "train_mse": [], "val_rel_l2": [], "val_pde_residual": [], "val_bc_err": []}
 
-    for epoch in range(1, args.epochs + 1):
+    if args.resume:
+        resume_path = ckpt_dir / "last_state.pt"
+        if resume_path.exists():
+            state = torch.load(resume_path, map_location=device, weights_only=False)
+            model.load_state_dict(state["model"])
+            optimizer.load_state_dict(state["optimizer"])
+            scheduler.load_state_dict(state["scheduler"])
+            best_rel_l2 = state["best_rel_l2"]
+            no_improve  = state["no_improve"]
+            start_epoch = state["epoch"] + 1
+            if "lambda_pde" in state:
+                args.lambda_pde = state["lambda_pde"]
+                print(f"[Resume] Restored lambda_pde={args.lambda_pde:.3e}")
+            hist_path = ckpt_dir / "history.json"
+            if hist_path.exists():
+                history = json.loads(hist_path.read_text())
+            print(f"[Resume] Epoch {start_epoch}, best_rel_L2={best_rel_l2:.4e}")
+        else:
+            print(f"[Resume] No checkpoint found at {resume_path}, starting fresh.")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         # -- train with per-batch progress bar --
         model.train()
         total_loss = total_ldata = total_lpde = total_lbc = 0.0
 
+        # -- GradNorm: directly compute target lambda_pde in one shot --
+        if args.dynamic_lambda and (epoch - 1) % args.lambda_update_interval == 0:
+            model.eval()
+            a_v, u_v, _ = next(iter(train_loader))
+            a_v = a_v.to(device); u_v = u_v.to(device)
+            u_p = model(a_v.unsqueeze(1)).squeeze(1)
+            l_d = criterion(u_p, u_v)
+            res_v = darcy_pde_residual(a_v, u_p.float())
+            if args.normalize_pde:
+                res_v = res_v / (a_v.shape[-2] - 1) ** 2
+            l_p   = (res_v ** 2).mean()
+            trainable = [p for p in model.parameters() if p.requires_grad]
+            # g_p uses unnormalized L_pde (no lambda), so lambda_target = grad_ratio * n_d / n_p
+            g_d = torch.autograd.grad(l_d, trainable, retain_graph=True, allow_unused=True)
+            g_p = torch.autograd.grad(l_p,             trainable, allow_unused=True)
+            n_d = sum(g.pow(2).sum() for g in g_d if g is not None).sqrt().item()
+            n_p = sum(g.pow(2).sum() for g in g_p if g is not None).sqrt().item()
+            if n_p > 1e-10 and n_d > 1e-10:
+                # Direct target: lambda s.t. |grad(lambda*Lpde)| = grad_ratio * |grad(Ldata)|
+                lam_target = args.grad_ratio * n_d / n_p
+                # EMA blend to avoid sudden jumps; range [1e-8, 1e-1]
+                args.lambda_pde = float(max(1e-5, min(1e-1,
+                    0.7 * args.lambda_pde + 0.3 * lam_target)))
+            model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:4d}/{args.epochs}", leave=False,
                     unit="batch", dynamic_ncols=True)
         for a, u, _ in pbar:
-            a, u = a.to(device), u.to(device)
-
-            u_pred = model(a.unsqueeze(1)).squeeze(1)
-
-            l_data = criterion(u_pred, u)
-            residual = darcy_pde_residual(a, u_pred)
-            l_pde = (residual ** 2).mean()
-            l_bc  = darcy_boundary_loss(u_pred)
+            a = a.to(device, non_blocking=True)
+            u = u.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                u_pred = model(a.unsqueeze(1)).squeeze(1)
+                l_data = criterion(u_pred, u)
+                residual = darcy_pde_residual(a, u_pred.float())
+                if args.normalize_pde:
+                    residual = residual / (a.shape[-2] - 1) ** 2
+                l_pde = (residual ** 2).mean()
+                l_bc  = darcy_boundary_loss(u_pred.float())
             loss  = l_data + args.lambda_pde * l_pde + args.lambda_bc * l_bc
-
-            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
@@ -189,11 +270,13 @@ def train(args: argparse.Namespace) -> None:
             total_lbc   += l_bc.item()   * B
             pbar.set_postfix(loss=f"{loss.item():.4e}",
                              pde=f"{l_pde.item():.3e}",
-                             bc=f"{l_bc.item():.3e}")
+                             bc=f"{l_bc.item():.3e}",
+                             lam=f"{args.lambda_pde:.2e}")
         pbar.close()
 
         scheduler.step()
         N_tr = len(train_set)
+        train_loss = total_ldata / N_tr   # data-loss per sample (for history)
 
         # -- evaluate every log_interval epochs --
         if epoch % args.log_interval == 0 or epoch == args.epochs:
@@ -201,9 +284,11 @@ def train(args: argparse.Namespace) -> None:
             metrics_accum = {"mse": 0., "rel_l2": 0., "pde_residual": 0., "boundary_err": 0.}
             with torch.no_grad():
                 for a, u, _ in test_loader:
-                    a, u = a.to(device), u.to(device)
-                    u_pred = model(a.unsqueeze(1)).squeeze(1)
-                    m = compute_metrics(a, u_pred, u)
+                    a = a.to(device, non_blocking=True)
+                    u = u.to(device, non_blocking=True)
+                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                        u_pred = model(a.unsqueeze(1)).squeeze(1)
+                    m = compute_metrics(a, u_pred.float(), u)
                     for k in metrics_accum:
                         metrics_accum[k] += m[k] * a.size(0)
             n = len(test_set)
@@ -217,12 +302,27 @@ def train(args: argparse.Namespace) -> None:
                   f"L_bc={total_lbc/N_tr:.3e}  | "
                   f"rel_L2={rel_l2:.4e}  "
                   f"pde_res={metrics_accum['pde_residual']:.4e}  "
-                  f"bc_err={metrics_accum['boundary_err']:.4e}")
+                  f"bc_err={metrics_accum['boundary_err']:.4e}  "
+                f"lambda_pde={args.lambda_pde:.2e}")
 
+            # ---- history ----
+            history["epoch"].append(epoch)
+            history["train_mse"].append(train_loss)
+            history["val_rel_l2"].append(rel_l2)
+            history["val_pde_residual"].append(metrics_accum["pde_residual"])
+            history["val_bc_err"].append(metrics_accum["boundary_err"])
+            (ckpt_dir / "history.json").write_text(json.dumps(history))
             if rel_l2 < best_rel_l2:
                 best_rel_l2 = rel_l2
                 no_improve  = 0
                 torch.save(model.state_dict(), ckpt_dir / "best_model.pt")
+                torch.save({
+                    "epoch": epoch, "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "best_rel_l2": best_rel_l2, "no_improve": no_improve,
+                    "lambda_pde": args.lambda_pde,
+                }, ckpt_dir / "last_state.pt")
                 print(f"  --> Best model saved (rel_L2={best_rel_l2:.4e})")
             else:
                 no_improve += 1

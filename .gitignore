@@ -7,6 +7,7 @@ pretrain_model/unet/*.tar
 
 # Trained checkpoints
 checkpoints/**/*.pt
+checkpoints/**/*.json
 
 # Python cache
 __pycache__/
@@ -18,3 +19,9 @@ __pycache__/
 
 # Results
 results/
+ablation_results/
+doc/
+Plan.md
+experiment_analysis_zh.md
+experiment_analysis.md
+*.bak
