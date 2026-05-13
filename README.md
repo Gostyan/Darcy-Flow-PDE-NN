@@ -1,4 +1,4 @@
-# Darcy Flow PDE — Neural Operator Benchmark
+# Darcy Flow PDE: UNet+PINN
 
 用神经网络求解二维稳态 Darcy 流方程：
 
